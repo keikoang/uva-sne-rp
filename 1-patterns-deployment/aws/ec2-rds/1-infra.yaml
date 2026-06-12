@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EC2, IAM role, security groups, and RDS SQL Server using imported private VPC network values
+
+Parameters:
+  InstanceName:
+    Type: String
+    Description: Base name for EC2/RDS resources
+
+  NetworkName:
+    Type: String
+    Description: Name prefix used when deploying vpc-network.yaml
+
+  DBUsername:
+    Type: String
+    Description: RDS master username
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters or underscores.
+
+  DBInstanceClass:
+    Type: String
+    Description: RDS instance class for SQL Server
+    Default: db.t3.micro
+
+  DBAllocatedStorage:
+    Type: Number
+    Description: Allocated storage for RDS in GiB
+    Default: 20
+
+  EC2InstanceType:
+    Type: String
+    Description: EC2 instance type for connectivity testing
+    Default: t3.small
+
+  LatestAmazonLinuxAmi:
+    Type: AWS::EC2::Image::Id
+    Description: Amazon Linux 2023 AMI ID
+
+Resources:
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${InstanceName}-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadRdsMasterSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${InstanceName}-ec2-instance-profile
+      Roles:
+        - !Ref EC2InstanceRole
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 security group with no inbound access
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: '${NetworkName}-vpc-id'
+      SecurityGroupIngress: []
+      SecurityGroupEgress: []
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS security group allowing SQL Server only from EC2
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: '${NetworkName}-vpc-id'
+      SecurityGroupIngress: []
+      SecurityGroupEgress: []
+
+  Ec2ToRdsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref Ec2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 1433
+      ToPort: 1433
+      DestinationSecurityGroupId: !Ref RdsSecurityGroup
+
+  Ec2ToHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref Ec2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnet group for RDS
+      SubnetIds:
+        - Fn::ImportValue:
+            Fn::Sub: '${NetworkName}-private-subnet-a-id'
+        - Fn::ImportValue:
+            Fn::Sub: '${NetworkName}-private-subnet-b-id'
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub ${InstanceName}-db
+      Engine: sqlserver-ex
+      LicenseModel: license-included
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+      MasterUsername: !Ref DBUsername
+      ManageMasterUserPassword: true
+      Port: 1433
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref EC2InstanceType
+      ImageId: !Ref LatestAmazonLinuxAmi
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          SubnetId:
+            Fn::ImportValue:
+              Fn::Sub: '${NetworkName}-private-subnet-a-id'
+          GroupSet:
+            - !Ref Ec2SecurityGroup
+          AssociatePublicIpAddress: false
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${InstanceName}-ec2
+
+Outputs:
+  ImportedVpcId:
+    Description: Imported VPC ID from network stack
+    Value:
+      Fn::ImportValue:
+        Fn::Sub: '${NetworkName}-vpc-id'
+    Export:
+      Name: !Sub '${InstanceName}-imported-vpc-id'
+
+  ImportedPrivateSubnetAId:
+    Description: Imported private subnet A ID from network stack
+    Value:
+      Fn::ImportValue:
+        Fn::Sub: '${NetworkName}-private-subnet-a-id'
+    Export:
+      Name: !Sub '${InstanceName}-imported-private-subnet-a-id'
+
+  ImportedPrivateSubnetBId:
+    Description: Imported private subnet B ID from network stack
+    Value:
+      Fn::ImportValue:
+        Fn::Sub: '${NetworkName}-private-subnet-b-id'
+    Export:
+      Name: !Sub '${InstanceName}-imported-private-subnet-b-id'
+
+  EC2InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${InstanceName}-ec2-instance-id'
+
+  EC2PrivateIp:
+    Description: Private IP address of the EC2 instance
+    Value: !GetAtt EC2Instance.PrivateIp
+    Export:
+      Name: !Sub '${InstanceName}-ec2-private-ip'
+
+  EC2InstanceRoleArn:
+    Description: EC2 instance role ARN
+    Value: !GetAtt EC2InstanceRole.Arn
+    Export:
+      Name: !Sub '${InstanceName}-ec2-role-arn'
+
+  EC2InstanceProfileName:
+    Description: EC2 instance profile name
+    Value: !Ref EC2InstanceProfile
+    Export:
+      Name: !Sub '${InstanceName}-ec2-instance-profile-name'
+
+  DatabaseEndpointAddress:
+    Description: Private RDS endpoint address
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub '${InstanceName}-db-endpoint-address'
+
+  DatabaseEndpointPort:
+    Description: RDS endpoint port
+    Value: !GetAtt Database.Endpoint.Port
+    Export:
+      Name: !Sub '${InstanceName}-db-endpoint-port'
+
+  DatabaseMasterSecretArn:
+    Description: ARN of the RDS managed master user secret
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export:
+      Name: !Sub '${InstanceName}-db-master-secret-arn'
+
+  Ec2SecurityGroupId:
+    Description: EC2 security group ID
+    Value: !Ref Ec2SecurityGroup
+    Export:
+      Name: !Sub '${InstanceName}-ec2-security-group-id'
+
+  RdsSecurityGroupId:
+    Description: RDS security group ID
+    Value: !Ref RdsSecurityGroup
+    Export:
+      Name: !Sub '${InstanceName}-rds-security-group-id'

@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  InstanceName:
+    Type: String
+    Description: Base name used for export naming (must match 1-infra.yaml)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID
+
+  EndpointSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets where the ECS instance is deployed
+
+  EcsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group attached to the ECS instance
+
+Resources:
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ECS tasks to reach ECR interface endpoints over HTTPS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EcsSecurityGroupId
+      SecurityGroupEgress: []
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref EndpointSubnets
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup   
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref EndpointSubnets
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+Outputs:
+  EcrApiEndpointId:
+    Value: !Ref EcrApiEndpoint
+    Export:
+      Name: !Sub '${InstanceName}-ecr-api-vpce-id'
+
+  EcrDockerEndpointId:
+    Value: !Ref EcrDkrEndpoint
+    Export:
+      Name: !Sub '${InstanceName}-ecr-dkr-vpce-id'

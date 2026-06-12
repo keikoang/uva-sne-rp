@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Static base infra with private S3 bucket and least-privilege Lambda access
+
+Parameters:
+  InstanceName:
+    Type: String
+    Description: Base name for S3 and Lambda resources
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Use only lowercase letters, numbers, and hyphens.
+
+Resources:
+  BaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${InstanceName}-bucket-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-bucket'
+
+  BaseBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BaseBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${BaseBucket}'
+              - !Sub 'arn:aws:s3:::${BaseBucket}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${InstanceName}-lambda'
+      RetentionInDays: 7
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${InstanceName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaMinimalLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${InstanceName}-lambda:*'
+        - PolicyName: S3ReadOnlyTestObject
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${BaseBucket}/test.txt'
+
+  TestLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${InstanceName}-lambda'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BaseBucket
+      Code:
+        ZipFile: |
+          import boto3, os, logging
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              bucket = os.environ['BUCKET_NAME']
+              key = 'test.txt'
+              logger.info(f"Reading s3://{bucket}/{key}")
+
+              s3 = boto3.client('s3')
+
+              try:
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  raw = obj['Body'].read()
+
+                  try:
+                      body = raw.decode('utf-8')
+                  except UnicodeDecodeError:
+                      body = raw.decode('utf-16')
+
+                  logger.info("Read succeeded")
+                  return {"statusCode": 200, "body": body}
+
+              except ClientError:
+                  logger.exception("S3 client error")
+                  raise
+              except Exception:
+                  logger.exception("Unexpected error")
+                  raise
+
+Outputs:
+  BucketName:
+    Description: Name of the private S3 bucket
+    Value: !Ref BaseBucket
+    Export:
+      Name: !Sub '${InstanceName}-bucket-name'
+
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref TestLambda
+    Export:
+      Name: !Sub '${InstanceName}-lambda-function-name'
+
+  LambdaRoleArn:
+    Description: Lambda IAM role ARN
+    Value: !GetAtt LambdaRole.Arn
+    Export:
+      Name: !Sub '${InstanceName}-lambda-role-arn'

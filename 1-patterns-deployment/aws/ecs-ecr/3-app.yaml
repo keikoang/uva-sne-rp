@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS application layer - task definition and ECS service
+
+Parameters:
+  RepositoryName:
+    Type: String
+
+  InstanceName:
+    Type: String
+
+  ImageTag:
+    Type: String
+
+  NetworkName:
+    Type: String
+    Description: Name prefix used when deploying vpc-network.yaml
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+
+  Cpu:
+    Type: String
+    Default: '256'
+    AllowedValues: ['256', '512', '1024', '2048', '4096']
+
+  Memory:
+    Type: String
+    Default: '512'
+    AllowedValues:
+      - '512'
+      - '1024'
+      - '2048'
+      - '3072'
+      - '4096'
+      - '5120'
+      - '6144'
+      - '7168'
+      - '8192'
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+
+  AssignPublicIp:
+    Type: String
+    Default: DISABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+
+Resources:
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${InstanceName}-task
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${InstanceName}-task-execution-role-arn
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${InstanceName}-task-role-arn
+      ContainerDefinitions:
+        - Name: connectivity-check
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepositoryName}:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: SERVICE_NAME
+              Value: ecs-to-ecr-connectivity-check
+            - Name: CLOUD_PROVIDER
+              Value: aws
+            - Name: PORT
+              Value: "8080"
+              
+  AppService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${InstanceName}-service
+      Cluster:
+        Fn::ImportValue: !Sub ${InstanceName}-ecs-cluster-name
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableExecuteCommand: true
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref AppTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          Subnets:
+            - Fn::ImportValue: !Sub '${NetworkName}-private-subnet-a-id'
+            - Fn::ImportValue: !Sub '${NetworkName}-private-subnet-b-id'
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${InstanceName}-ecs-security-group-id

@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Base infrastructure for ECR, ECS cluster, IAM roles, security groups
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Description: Name of the ECR repository
+
+  NetworkName:
+    Type: String
+    Description: Name prefix used when deploying vpc-network.yaml
+
+  InstanceName:
+    Type: String
+    Description: Base name for ECS/ECR resources
+
+  EcrApiVpceId:
+    Type: String
+    Default: ''
+    Description: VPC endpoint ID for ecr.api (set after 2-solution.yaml is deployed)
+
+  EcrDkrVpceId:
+    Type: String
+    Default: ''
+    Description: VPC endpoint ID for ecr.dkr (set after 2-solution.yaml is deployed)
+
+  S3PrefixListId:
+    Type: String
+    Description: Managed prefix list ID for S3 in this region (e.g. pl-xxxxxx), used to scope egress to S3 gateway endpoint
+
+Conditions:
+  HasVpcePolicy: !And
+    - !Not [!Equals [!Ref EcrApiVpceId, '']]
+    - !Not [!Equals [!Ref EcrDkrVpceId, '']]
+
+Resources:
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      RepositoryPolicyText: !If
+        - HasVpcePolicy
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: DenyPublicAccess
+              Effect: Deny
+              Principal: '*'
+              Action:
+                - ecr:GetAuthorizationToken
+                - ecr:BatchGetImage
+                - ecr:GetDownloadUrlForLayer
+                - ecr:BatchCheckLayerAvailability
+                - ecr:InitiateLayerUpload
+                - ecr:UploadLayerPart
+                - ecr:CompleteLayerUpload
+                - ecr:PutImage
+                - ecr:ListImages
+              Condition:
+                StringNotEquals:
+                  aws:SourceVpce:
+                    - !Ref EcrApiVpceId
+                    - !Ref EcrDkrVpceId
+        - !Ref AWS::NoValue
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${InstanceName}-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${InstanceName}-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${InstanceName}-ecr-pull-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RepositoryName}"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${InstanceName}:*"
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${InstanceName}-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${InstanceName}-ecs-exec-ssm-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+        - PolicyName: !Sub ${InstanceName}-ecr-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: ecr:ListImages
+                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RepositoryName}'
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS task security group - no ingress, HTTPS to VPC and S3 only
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: '${NetworkName}-vpc-id'
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp:
+            Fn::ImportValue:
+              Fn::Sub: '${NetworkName}-vpc-cidr'
+          Description: Allow HTTPS within VPC
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref S3PrefixListId
+          Description: Allow HTTPS to S3 via gateway endpoint (ECR image layers)
+      Tags:
+        - Key: Name
+          Value: !Sub ${InstanceName}-ecs-sg
+
+Outputs:
+  ECRRepositoryUri:
+    Description: ECR repository URI
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${InstanceName}-ecr-repository-uri'
+
+  ECRRepositoryName:
+    Description: ECR repository name
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub '${InstanceName}-ecr-repository-name'
+
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${InstanceName}-ecs-cluster-name'
+
+  ECSTaskExecutionRoleArn:
+    Description: ECS task execution role ARN
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${InstanceName}-task-execution-role-arn'
+
+  ECSTaskRoleArn:
+    Description: ECS task role ARN
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${InstanceName}-task-role-arn'
+
+  EcsSecurityGroupId:
+    Description: ECS task security group ID
+    Value: !Ref EcsSecurityGroup
+    Export:
+      Name: !Sub '${InstanceName}-ecs-security-group-id'
